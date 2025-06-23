@@ -22,4 +22,9 @@ export class AuthService {
     const token = this.jwtService.sign(payload);
     return { access_token: token };
   }
+
+  decodeToken(token: string): any {
+    return this.jwtService.decode(token);
+    }
+
 }

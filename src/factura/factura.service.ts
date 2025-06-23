@@ -21,7 +21,6 @@ export class FacturaService {
     const empresa: Empresa | null = await this.empresaService.buscarPorId(dto.empresaId);
     if (!empresa) throw new Error('Empresa no encontrada');
 
-    // Llamar a la API externa
     interface FacturaApiResponse {
       cae: string;
       vencimiento: string;
@@ -30,14 +29,41 @@ export class FacturaService {
       qr_url: string;
     }
 
-    const response = await axios.post<FacturaApiResponse>('https://facturador-production.up.railway.app/facturas', {
-      cuit_emisor: dto.cuit_emisor,
-      importe_total: dto.importe_total,
-      test: dto.test,
-      punto_venta: dto.punto_venta,
-      factura_tipo: dto.factura_tipo,
-      metodo_pago: dto.metodo_pago,
-    });
+    // ----------------------------
+    // Intentar 1 vez y reintentar si falla con error 500
+    let response;
+    try {
+      response = await axios.post<FacturaApiResponse>(
+        'https://facturador-production.up.railway.app/facturas',
+        {
+          cuit_emisor: dto.cuit_emisor,
+          importe_total: dto.importe_total,
+          test: dto.test,
+          punto_venta: dto.punto_venta,
+          factura_tipo: dto.factura_tipo,
+          metodo_pago: dto.metodo_pago,
+        }
+      );
+    } catch (error) {
+      if (error.response?.status === 500) {
+        // Esperar 500 ms y reintentar
+        await new Promise((res) => setTimeout(res, 500));
+        response = await axios.post<FacturaApiResponse>(
+          'https://facturador-production.up.railway.app/facturas',
+          {
+            cuit_emisor: dto.cuit_emisor,
+            importe_total: dto.importe_total,
+            test: dto.test,
+            punto_venta: dto.punto_venta,
+            factura_tipo: dto.factura_tipo,
+            metodo_pago: dto.metodo_pago,
+          }
+        );
+      } else {
+        throw error;
+      }
+    }
+    // ----------------------------
 
     const { cae, vencimiento, nro_comprobante, fecha, qr_url } = response.data;
 

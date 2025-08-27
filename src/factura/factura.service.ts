@@ -2,11 +2,12 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Factura } from './factura.entity';
-import { Repository } from 'typeorm';
+import { DeepPartial, Repository } from 'typeorm';
 import { CrearFacturaDto } from './dto/crear-factura.dto'; // opcional
 import { Empresa } from 'src/empresa/empresa.entity';
 import { EmpresaService } from 'src/empresa/empresa.service';
 import axios from 'axios';
+import { FacturaLog } from './factura-log.entity';
 
 type AlicuotaIva = {
   id_iva: number;
@@ -63,6 +64,8 @@ export class FacturaService {
   constructor(
     @InjectRepository(Factura)
     private readonly facturaRepo: Repository<Factura>,
+    @InjectRepository(FacturaLog)
+    private readonly facturaLogRepo: Repository<FacturaLog>,
     private readonly empresaService: EmpresaService,
   ) {}
 
@@ -104,66 +107,96 @@ export class FacturaService {
   }
 
   async crearFactura(dto: CrearFacturaConLoginPayload): Promise<Factura> {
-    // === Empresa ===
-    const empresaIdNum = Number(dto.empresaId);
-    if (!Number.isFinite(empresaIdNum)) {
-      throw new Error('empresaId inválido o ausente');
-    }
-    const empresa: Empresa | null = await this.empresaService.buscarPorId(empresaIdNum);
-    if (!empresa) throw new Error('Empresa no encontrada');
+  // === Empresa ===
+  const empresaIdNum = Number(dto.empresaId);
+  if (!Number.isFinite(empresaIdNum)) {
+    throw new Error('empresaId inválido o ausente');
+  }
+  const empresa: Empresa | null = await this.empresaService.buscarPorId(empresaIdNum);
+  if (!empresa) throw new Error('Empresa no encontrada');
 
-    // === Normalización de defaults ===
-    const payload = this.pruneUndefined({
-      // Emisor / compra
-      cuit_emisor: String(dto.cuit_emisor),
-      importe_total: Number(dto.importe_total),
+  // === Normalización de defaults ===
+  const payload = this.pruneUndefined({
+    cuit_emisor: String(dto.cuit_emisor),
+    importe_total: Number(dto.importe_total),
 
-      test: dto.test ?? true,
-      punto_venta: dto.punto_venta ?? 1,
+    test: dto.test ?? true,
+    punto_venta: dto.punto_venta ?? 1,
 
-      // Receptor
-      doc_tipo: dto.doc_tipo ?? 99,
-      doc_nro: dto.doc_nro ?? 0,
-      cond_iva_receptor: dto.cond_iva_receptor ?? 5,
+    // Receptor
+    doc_tipo: dto.doc_tipo ?? 99,
+    doc_nro: dto.doc_nro ?? 0,
+    cond_iva_receptor: dto.cond_iva_receptor ?? 5,
 
-      // Factura
-      factura_tipo: dto.factura_tipo ?? 11,
-      metodo_pago: dto.metodo_pago ?? 1,
+    // Factura
+    factura_tipo: dto.factura_tipo ?? 11,
+    metodo_pago: dto.metodo_pago ?? 1,
 
-      importe_neto: dto.importe_neto ?? null,
-      importe_iva: dto.importe_iva ?? 0.0,
-      importe_total_concepto: dto.importe_total_concepto ?? 0.0,
-      importe_exento: dto.importe_exento ?? 0.0,
-      importe_tributos: dto.importe_tributos ?? 0.0,
+    importe_neto: dto.importe_neto ?? null,
+    importe_iva: dto.importe_iva ?? 0.0,
+    importe_total_concepto: dto.importe_total_concepto ?? 0.0,
+    importe_exento: dto.importe_exento ?? 0.0,
+    importe_tributos: dto.importe_tributos ?? 0.0,
 
-      alicuotas_iva: dto.alicuotas_iva ?? null,
+    alicuotas_iva: dto.alicuotas_iva ?? null,
 
-      // Moneda / concepto
-      moneda: dto.moneda ?? 'PES',
-      moneda_pago: dto.moneda_pago ?? 'N',
-      cotizacion: dto.cotizacion ?? '1',
-      concepto: dto.concepto ?? 1,
+    // Moneda / concepto
+    moneda: dto.moneda ?? 'PES',
+    moneda_pago: dto.moneda_pago ?? 'N',
+    cotizacion: dto.cotizacion ?? '1',
+    concepto: dto.concepto ?? 1,
 
-      // NC/ND
-      tipo_comprobante_original: dto.tipo_comprobante_original ?? null,
-      pto_venta_original: dto.pto_venta_original ?? null,
-      nro_comprobante_original: dto.nro_comprobante_original ?? null,
-      cuit_receptor_comprobante_original: dto.cuit_receptor_comprobante_original ?? null,
-    });
+    // NC/ND
+    tipo_comprobante_original: dto.tipo_comprobante_original ?? null,
+    pto_venta_original: dto.pto_venta_original ?? null,
+    nro_comprobante_original: dto.nro_comprobante_original ?? null,
+    cuit_receptor_comprobante_original: dto.cuit_receptor_comprobante_original ?? null,
+  });
 
-    interface FacturaApiResponse {
-      cae: string;
-      vencimiento: string;
-      nro_comprobante: string;
-      fecha: string;
-      qr_url: string;
-    }
+  // snapshot de request (sin password)
+  const requestSnapshot = {
+    email: dto.email ?? null,
+    // password: NUNCA guardar - si querés, un flag:
+    used_password_login: !!dto.password,
+    ...payload,
+  };
 
-    const url = 'https://facturador-production.up.railway.app/facturas';
+  interface FacturaApiResponse {
+    cae: string;
+    vencimiento: string;
+    nro_comprobante: string;
+    fecha: string;
+    qr_url: string;
+  }
 
-    // === Llamada con retry 1 vez si 5xx o error de red típico ===
-    let response: { data: FacturaApiResponse } | undefined;
-    let attempts = 0;
+  const url = 'https://facturador-production.up.railway.app/facturas';
+
+  // === Auditoría: registro "pending"
+  const started = Date.now();
+  const logPending = this.facturaLogRepo.create({
+    empresa,
+    empresa_id: empresa.id,
+    email: dto.email ?? null,
+    used_password_login: !!dto.password,
+    cuit_emisor: String(payload.cuit_emisor),
+    punto_venta: Number(payload.punto_venta),
+    factura_tipo: Number(payload.factura_tipo),
+    importe_total: String(payload.importe_total?.toFixed?.(2) ?? Number(payload.importe_total).toFixed(2)),
+    request_payload: requestSnapshot,
+    response_payload: null,
+    status: 'pending',
+    attempts: 0,
+    duration_ms: null,
+    factura: null,
+    factura_id: null,
+  });
+  const log = await this.facturaLogRepo.save(logPending);
+
+  // === Llamada con retry (hasta 2)
+  let response: { data: FacturaApiResponse } | undefined;
+  let attempts = 0;
+
+  try {
     while (attempts < 2) {
       attempts++;
       try {
@@ -179,7 +212,7 @@ export class FacturaService {
           ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes((error as any)?.code);
 
         if (attempts < 2 && isTransient) {
-          await this.sleep(attempts * 500); // backoff simple 0.5s, 1s
+          await this.sleep(attempts * 500); // backoff 0.5s, 1s
           continue;
         }
 
@@ -187,14 +220,31 @@ export class FacturaService {
           (error as any)?.response?.data?.message ||
           (error as any)?.message ||
           'Error desconocido al facturar';
+
+        // Guardar log en error y re-lanzar
+        await this.facturaLogRepo.update(log.id, {
+          status: 'error',
+          attempts,
+          duration_ms: Date.now() - started,
+          error_message: String(msg),
+          response_payload: (error as any)?.response?.data ?? null,
+        });
+
         throw new Error(`Error al facturar: ${msg}`);
       }
     }
 
     if (!response) {
+      await this.facturaLogRepo.update(log.id, {
+        status: 'error',
+        attempts,
+        duration_ms: Date.now() - started,
+        error_message: 'Sin respuesta de la API de facturación.',
+      });
       throw new Error('Sin respuesta de la API de facturación.');
     }
 
+    // === Persistir Factura “cruda” como antes
     const { cae, vencimiento, nro_comprobante, fecha, qr_url } = response.data;
 
     const factura = this.facturaRepo.create({
@@ -205,9 +255,38 @@ export class FacturaService {
       qr_url,
       empresa,
     });
+    const facturaSaved = await this.facturaRepo.save(factura);
 
-    return this.facturaRepo.save(factura);
+    // === Actualizar log con SUCCESS + response
+    const partial: DeepPartial<FacturaLog> = {
+    id: log.id, // <- PK para actualizar
+    status: 'success',
+    attempts,
+    duration_ms: Date.now() - started,
+    response_payload: {
+      ...response.data,
+      // ⚠️ NO JSON.stringify: es JSONB, TypeORM serializa
+      factura_snapshot: {
+        id: facturaSaved.id,
+        cae: facturaSaved.cae,
+        vencimiento: facturaSaved.vencimiento,
+        nro_comprobante: facturaSaved.nro_comprobante,
+        fecha: facturaSaved.fecha,
+        qr_url: facturaSaved.qr_url,
+      },
+    },
+    factura_id: facturaSaved.id, // setear FK, no objeto relación aquí
+  };
+
+  await this.facturaLogRepo.save(partial);
+
+    return facturaSaved;
+  } catch (e) {
+    // ya se actualizó el log a 'error' adentro del catch del bucle
+    throw e;
   }
+}
+
 
   async obtenerTodas(empresaId: number): Promise<Factura[]> {
     return this.facturaRepo.find({

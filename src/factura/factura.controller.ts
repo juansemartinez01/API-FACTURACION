@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Param, Body, Query, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Param, Body, Query, NotFoundException, UsePipes, ValidationPipe } from '@nestjs/common';
 import { FacturaService } from './factura.service';
 import { Factura } from './factura.entity';
 import { CrearFacturaConLoginDto } from './dto/crear-factura-login.dto';
 import { AuthService } from 'src/auth/auth.service';
+import { QueryFacturaLogDto } from './dto/query-factura-log.dto';
 
 @Controller('facturas')
 export class FacturaController {
@@ -25,6 +26,17 @@ export class FacturaController {
       token: access_token,
       factura,
     };
+  }
+
+
+  /**
+   * GET /facturas/logs?empresaId=1&status=success&page=1&pageSize=20&from=2025-08-01&to=2025-08-31
+   */
+  @Get('logs')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async listLogs(@Query() query: QueryFacturaLogDto) {
+    const res = await this.facturaService.listFacturaLogs(query);
+    return res;
   }
 
   @Get()

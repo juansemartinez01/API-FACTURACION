@@ -8,6 +8,39 @@ import { Empresa } from 'src/empresa/empresa.entity';
 import { EmpresaService } from 'src/empresa/empresa.service';
 import axios from 'axios';
 import { FacturaLog } from './factura-log.entity';
+import { QueryFacturaLogDto } from './dto/query-factura-log.dto';
+import { SelectQueryBuilder } from 'typeorm';
+
+export type FacturaLogListResult = {
+  items: FacturaLog[];
+  meta: {
+    page: number;
+    pageSize: number;
+    total: number;
+    totalPages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+  };
+};
+
+function normalizeDateStart(s: string) {
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return undefined;
+  // inicio del día
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+function normalizeDateEnd(s: string) {
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return undefined;
+  // fin del día
+  d.setHours(23, 59, 59, 999);
+  return d.toISOString();
+}
+
+
+
 
 type AlicuotaIva = {
   id_iva: number;
@@ -300,5 +333,77 @@ export class FacturaService {
       where: { id },
       relations: ['empresa'],
     });
+  }
+
+
+
+
+
+
+
+
+  async listFacturaLogs(query: QueryFacturaLogDto): Promise<FacturaLogListResult> {
+    const {
+      empresaId, status, cuit, punto_venta, factura_tipo,
+      has_factura, email, used_password_login, attemptsMin, attemptsMax,
+      search, from, to, minImporte, maxImporte, sortBy = 'created_at', sortDir = 'DESC',
+      page = 1, pageSize = 20,
+    } = query;
+
+    const qb = this.facturaLogRepo.createQueryBuilder('l')
+      .leftJoinAndSelect('l.factura', 'f')
+      .where('l.empresa_id = :empresaId', { empresaId });
+
+    // Filtros
+    if (status) qb.andWhere('l.status = :status', { status });
+    if (cuit) qb.andWhere('l.cuit_emisor = :cuit', { cuit });
+    if (typeof punto_venta === 'number') qb.andWhere('l.punto_venta = :pto', { pto: punto_venta });
+    if (typeof factura_tipo === 'number') qb.andWhere('l.factura_tipo = :ft', { ft: factura_tipo });
+    if (typeof has_factura === 'boolean') {
+      qb.andWhere(has_factura ? 'l.factura_id IS NOT NULL' : 'l.factura_id IS NULL');
+    }
+    if (email) qb.andWhere('l.email ILIKE :email', { email: `%${email}%` });
+    if (typeof used_password_login === 'boolean') qb.andWhere('l.used_password_login = :upl', { upl: used_password_login });
+
+    if (typeof attemptsMin === 'number') qb.andWhere('l.attempts >= :amin', { amin: attemptsMin });
+    if (typeof attemptsMax === 'number') qb.andWhere('l.attempts <= :amax', { amax: attemptsMax });
+
+    const fromISO = from ? normalizeDateStart(from) : undefined;
+    const toISO = to ? normalizeDateEnd(to) : undefined;
+    if (fromISO) qb.andWhere('l.created_at >= :from', { from: fromISO });
+    if (toISO) qb.andWhere('l.created_at <= :to', { to: toISO });
+
+    if (typeof minImporte === 'number') qb.andWhere('l.importe_total >= :imin', { imin: minImporte });
+    if (typeof maxImporte === 'number') qb.andWhere('l.importe_total <= :imax', { imax: maxImporte });
+
+    if (search) qb.andWhere('l.error_message ILIKE :s', { s: `%${search}%` });
+
+    // Orden
+    const dir = (String(sortDir).toUpperCase() === 'ASC' ? 'ASC' : 'DESC') as 'ASC' | 'DESC';
+    const sortColumn = ['created_at', 'importe_total', 'attempts', 'status'].includes(sortBy)
+      ? sortBy
+      : 'created_at';
+    qb.orderBy(`l.${sortColumn}`, dir);
+
+    // Paginación
+    const take = pageSize;
+    const skip = (page - 1) * pageSize;
+    qb.take(take).skip(skip);
+
+    const [items, total] = await qb.getManyAndCount();
+
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+    return {
+      items,
+      meta: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1,
+      },
+    };
   }
 }

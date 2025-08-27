@@ -6,9 +6,10 @@ import { FacturaService } from './factura.service';
 import { FacturaController } from './factura.controller';
 import { EmpresaModule } from 'src/empresa/empresa.module';
 import { AuthModule } from 'src/auth/auth.module';
+import { FacturaLog } from './factura-log.entity';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Factura]),
+  imports: [TypeOrmModule.forFeature([Factura,FacturaLog]),
   EmpresaModule,
   AuthModule],
   providers: [FacturaService],

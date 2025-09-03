@@ -3,13 +3,11 @@ import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Factura } from './factura.entity';
 import { DeepPartial, Repository } from 'typeorm';
-import { CrearFacturaDto } from './dto/crear-factura.dto'; // opcional
 import { Empresa } from 'src/empresa/empresa.entity';
 import { EmpresaService } from 'src/empresa/empresa.service';
 import axios from 'axios';
 import { FacturaLog } from './factura-log.entity';
 import { QueryFacturaLogDto } from './dto/query-factura-log.dto';
-import { SelectQueryBuilder } from 'typeorm';
 
 export type FacturaLogListResult = {
   items: FacturaLog[];
@@ -26,7 +24,6 @@ export type FacturaLogListResult = {
 function normalizeDateStart(s: string) {
   const d = new Date(s);
   if (isNaN(d.getTime())) return undefined;
-  // inicio del día
   d.setHours(0, 0, 0, 0);
   return d.toISOString();
 }
@@ -34,13 +31,9 @@ function normalizeDateStart(s: string) {
 function normalizeDateEnd(s: string) {
   const d = new Date(s);
   if (isNaN(d.getTime())) return undefined;
-  // fin del día
   d.setHours(23, 59, 59, 999);
   return d.toISOString();
 }
-
-
-
 
 type AlicuotaIva = {
   id_iva: number;
@@ -49,7 +42,7 @@ type AlicuotaIva = {
 };
 
 type CrearFacturaConLoginPayload = {
-  // login (no se envían a la API externa)
+  // login (opcional, pueden o no enviarse)
   email?: string;
   password?: string;
   token?: string;
@@ -102,13 +95,14 @@ export class FacturaService {
     private readonly empresaService: EmpresaService,
   ) {}
 
-  // Axios preconfigurado (solo timeout + headers para compat con tipos viejos)
+  // Axios preconfigurado: más timeout y validateStatus para no perder body de error
   private axiosClient = axios.create({
-    timeout: 10000, // 10s
+    timeout: 15000, // 15s
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/plain, */*',
     },
+    validateStatus: () => true, // Nunca throw por status; decidimos nosotros
   });
 
   private sleep(ms: number) {
@@ -119,207 +113,290 @@ export class FacturaService {
     return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as T;
   }
 
-  // Logger conciso (sin AxiosError para evitar issues de tipos)
-  private logAxiosError(ctx: string, err: any, meta?: Record<string, any>) {
-    const status = err?.response?.status;
-    const dataMsg = err?.response?.data?.message ?? err?.response?.data?.error ?? err?.response?.data;
-    const code = err?.code;
-    const method = err?.config?.method?.toUpperCase();
-    const target = err?.config?.url;
-    const msg = err?.message;
+  // Util para serializar sin referencias circulares
+  private safeJson(data: any) {
+    try {
+      return typeof data === 'string' ? data : JSON.stringify(data);
+    } catch {
+      return '[unserializable]';
+    }
+  }
+
+  // Logger conciso con request/response (todo en 'any' para evitar errores de tipos)
+  private logAxiosError(ctx: string, errOrResponse: any, meta?: Record<string, any>) {
+    const res: any = errOrResponse?.response ?? errOrResponse; // puede ser response directo por validateStatus
+    const req: any = errOrResponse?.config ?? res?.config;
+
+    const status = res?.status;
+    const statusText = res?.statusText;
+    const data = res?.data;
+    const headers = res?.headers;
+
+    const code = errOrResponse?.code;
+    const message = errOrResponse?.message ?? `HTTP ${status} ${statusText ?? ''}`.trim();
 
     console.error(`[${ctx}]`, {
-      status,
       code,
-      method,
-      url: target,
-      message: msg,
-      dataMessage: typeof dataMsg === 'string' ? dataMsg : undefined,
+      message,
+      method: req?.method?.toUpperCase?.(),
+      url: req?.url,
+      requestHeaders: req?.headers,
+      requestData: this.safeJson(req?.data),
+      status,
+      statusText,
+      responseHeaders: headers,
+      responseData: this.safeJson(data),
       ...(meta ?? {}),
     });
   }
 
+  private buildHeaders(dto: CrearFacturaConLoginPayload): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/plain, */*',
+    };
+
+    // Si tu API usa token/sign por header propio:
+    if (dto.token && dto.sign) {
+      headers['X-AFIP-Token'] = String(dto.token);
+      headers['X-AFIP-Sign'] = String(dto.sign);
+    } else if (dto.token) {
+      // Alternativa común: Authorization: Bearer
+      headers['Authorization'] = `Bearer ${String(dto.token)}`;
+    }
+
+    return headers;
+  }
+
   async crearFactura(dto: CrearFacturaConLoginPayload): Promise<Factura> {
-  // === Empresa ===
-  const empresaIdNum = Number(dto.empresaId);
-  if (!Number.isFinite(empresaIdNum)) {
-    throw new Error('empresaId inválido o ausente');
-  }
-  const empresa: Empresa | null = await this.empresaService.buscarPorId(empresaIdNum);
-  if (!empresa) throw new Error('Empresa no encontrada');
+    // === Empresa ===
+    const empresaIdNum = Number(dto.empresaId);
+    if (!Number.isFinite(empresaIdNum)) {
+      throw new Error('empresaId inválido o ausente');
+    }
+    const empresa: Empresa | null = await this.empresaService.buscarPorId(empresaIdNum);
+    if (!empresa) throw new Error('Empresa no encontrada');
 
-  // === Normalización de defaults ===
-  const payload = this.pruneUndefined({
-    cuit_emisor: String(dto.cuit_emisor),
-    importe_total: Number(dto.importe_total),
+    // === Normalización de defaults y coherencia de IVA ===
+    const total = Number(dto.importe_total);
+    const iva = dto.importe_iva ?? 0;
+    const netoCalculado = iva > 0 ? (total - iva) : total;
 
-    test: dto.test ?? true,
-    punto_venta: dto.punto_venta ?? 1,
+    const alicuotas =
+      iva > 0
+        ? (dto.alicuotas_iva ?? [
+            {
+              id_iva: 5, // 21% típico
+              base_imponible: Number(netoCalculado),
+              importe: Number(iva),
+            },
+          ])
+        : null;
 
-    // Receptor
-    doc_tipo: dto.doc_tipo ?? 99,
-    doc_nro: dto.doc_nro ?? 0,
-    cond_iva_receptor: dto.cond_iva_receptor ?? 5,
+    const payload = this.pruneUndefined({
+      // enviar CUIT como número
+      cuit_emisor: Number(dto.cuit_emisor),
+      importe_total: total,
 
-    // Factura
-    factura_tipo: dto.factura_tipo ?? 11,
-    metodo_pago: dto.metodo_pago ?? 1,
+      test: dto.test ?? true,
+      punto_venta: dto.punto_venta ?? 1,
 
-    importe_neto: dto.importe_neto ?? null,
-    importe_iva: dto.importe_iva ?? 0.0,
-    importe_total_concepto: dto.importe_total_concepto ?? 0.0,
-    importe_exento: dto.importe_exento ?? 0.0,
-    importe_tributos: dto.importe_tributos ?? 0.0,
+      // Receptor
+      doc_tipo: dto.doc_tipo ?? 99,
+      doc_nro: dto.doc_nro ?? 0,
+      cond_iva_receptor: dto.cond_iva_receptor ?? 5,
 
-    alicuotas_iva: dto.alicuotas_iva ?? null,
+      // Factura
+      factura_tipo: dto.factura_tipo ?? 11,
+      metodo_pago: dto.metodo_pago ?? 1,
 
-    // Moneda / concepto
-    moneda: dto.moneda ?? 'PES',
-    moneda_pago: dto.moneda_pago ?? 'N',
-    cotizacion: dto.cotizacion ?? '1',
-    concepto: dto.concepto ?? 1,
+      // IVA coherente
+      importe_neto: dto.importe_neto ?? Number(netoCalculado),
+      importe_iva: Number(iva),
+      importe_total_concepto: dto.importe_total_concepto ?? 0.0,
+      importe_exento: dto.importe_exento ?? 0.0,
+      importe_tributos: dto.importe_tributos ?? 0.0,
 
-    // NC/ND
-    tipo_comprobante_original: dto.tipo_comprobante_original ?? null,
-    pto_venta_original: dto.pto_venta_original ?? null,
-    nro_comprobante_original: dto.nro_comprobante_original ?? null,
-    cuit_receptor_comprobante_original: dto.cuit_receptor_comprobante_original ?? null,
-  });
+      alicuotas_iva: alicuotas,
 
-  // snapshot de request (sin password)
-  const requestSnapshot = {
-    email: dto.email ?? null,
-    // password: NUNCA guardar - si querés, un flag:
-    used_password_login: !!dto.password,
-    ...payload,
-  };
+      // Moneda / concepto
+      moneda: dto.moneda ?? 'PES',
+      moneda_pago: dto.moneda_pago ?? 'N',
+      cotizacion: dto.cotizacion ?? '1',
+      concepto: dto.concepto ?? 1,
 
-  interface FacturaApiResponse {
-    cae: string;
-    vencimiento: string;
-    nro_comprobante: string;
-    fecha: string;
-    qr_url: string;
-  }
+      // NC/ND
+      tipo_comprobante_original: dto.tipo_comprobante_original ?? null,
+      pto_venta_original: dto.pto_venta_original ?? null,
+      nro_comprobante_original: dto.nro_comprobante_original ?? null,
+      cuit_receptor_comprobante_original: dto.cuit_receptor_comprobante_original ?? null,
+    });
 
-  const url = 'https://facturador-production.up.railway.app/facturas';
+    // snapshot de request (sin password)
+    const requestSnapshot = {
+      email: dto.email ?? null,
+      used_password_login: !!dto.password,
+      ...payload,
+    };
 
-  // === Auditoría: registro "pending"
-  const started = Date.now();
-  const logPending = this.facturaLogRepo.create({
-    empresa,
-    empresa_id: empresa.id,
-    email: dto.email ?? null,
-    used_password_login: !!dto.password,
-    cuit_emisor: String(payload.cuit_emisor),
-    punto_venta: Number(payload.punto_venta),
-    factura_tipo: Number(payload.factura_tipo),
-    importe_total: String(payload.importe_total?.toFixed?.(2) ?? Number(payload.importe_total).toFixed(2)),
-    request_payload: requestSnapshot,
-    response_payload: null,
-    status: 'pending',
-    attempts: 0,
-    duration_ms: null,
-    factura: null,
-    factura_id: null,
-  });
-  const log = await this.facturaLogRepo.save(logPending);
+    interface FacturaApiResponse {
+      cae: string;
+      vencimiento: string;
+      nro_comprobante: string;
+      fecha: string;
+      qr_url: string;
+    }
 
-  // === Llamada con retry (hasta 2)
-  let response: { data: FacturaApiResponse } | undefined;
-  let attempts = 0;
+    const url = 'https://facturador-production.up.railway.app/facturas';
 
-  try {
-    while (attempts < 2) {
-      attempts++;
-      try {
-        response = await this.axiosClient.post<FacturaApiResponse>(url, payload);
-        break; // OK
-      } catch (error) {
-        const status = (error as any)?.response?.status;
-        this.logAxiosError(`facturar:intento_${attempts}`, error);
+    // === Auditoría: registro "pending"
+    const started = Date.now();
+    const logPending = this.facturaLogRepo.create({
+      empresa,
+      empresa_id: empresa.id,
+      email: dto.email ?? null,
+      used_password_login: !!dto.password,
+      cuit_emisor: String(payload.cuit_emisor),
+      punto_venta: Number(payload.punto_venta),
+      factura_tipo: Number(payload.factura_tipo),
+      importe_total: String(
+        (payload as any).importe_total?.toFixed?.(2) ??
+          Number((payload as any).importe_total).toFixed(2),
+      ),
+      request_payload: requestSnapshot,
+      response_payload: null,
+      status: 'pending',
+      attempts: 0,
+      duration_ms: null,
+      factura: null,
+      factura_id: null,
+    });
+    const log = await this.facturaLogRepo.save(logPending);
+
+    // === Llamada con retry (hasta 2)
+    let response: any | undefined;
+    let attempts = 0;
+
+    try {
+      const headers = this.buildHeaders(dto);
+
+      while (attempts < 2) {
+        attempts++;
+
+        response = await this.axiosClient.post(url, payload, { headers });
+
+        if (response?.status >= 200 && response?.status < 300) {
+          // OK
+          break;
+        }
+
+        // No-2xx: logueo y decido si reintento
+        this.logAxiosError(`facturar:intento_${attempts}`, response);
 
         const isTransient =
-          !status ||
-          (status >= 500 && status <= 599) ||
-          ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes((error as any)?.code);
+          !response?.status ||
+          (response.status >= 500 && response.status <= 599);
 
         if (attempts < 2 && isTransient) {
           await this.sleep(attempts * 500); // backoff 0.5s, 1s
           continue;
         }
 
+        // Guardar log en error y lanzar
         const msg =
-          (error as any)?.response?.data?.message ||
-          (error as any)?.message ||
-          'Error desconocido al facturar';
+          (typeof response?.data === 'string'
+            ? response.data
+            : response?.data?.message) ||
+          `HTTP ${response?.status}`;
 
-        // Guardar log en error y re-lanzar
         await this.facturaLogRepo.update(log.id, {
           status: 'error',
           attempts,
           duration_ms: Date.now() - started,
           error_message: String(msg),
-          response_payload: (error as any)?.response?.data ?? null,
+          response_payload: {
+            status: response?.status ?? null,
+            headers: response?.headers ?? null,
+            data:
+              typeof response?.data === 'string'
+                ? response.data
+                : (response?.data ?? null),
+          },
         });
 
         throw new Error(`Error al facturar: ${msg}`);
       }
-    }
 
-    if (!response) {
-      await this.facturaLogRepo.update(log.id, {
-        status: 'error',
+      if (!response || !(response.status >= 200 && response.status < 300)) {
+        await this.facturaLogRepo.update(log.id, {
+          status: 'error',
+          attempts,
+          duration_ms: Date.now() - started,
+          error_message: 'Sin respuesta válida de la API de facturación.',
+        });
+        throw new Error('Sin respuesta válida de la API de facturación.');
+      }
+
+      // === Persistir Factura “cruda” como antes
+      const { cae, vencimiento, nro_comprobante, fecha, qr_url } = response.data as FacturaApiResponse;
+
+      const factura = this.facturaRepo.create({
+        cae,
+        vencimiento,
+        nro_comprobante: Number(nro_comprobante),
+        fecha,
+        qr_url,
+        empresa,
+      });
+      const facturaSaved = await this.facturaRepo.save(factura);
+
+      // === Actualizar log con SUCCESS + response
+      const partial: DeepPartial<FacturaLog> = {
+        id: log.id, // <- PK para actualizar
+        status: 'success',
         attempts,
         duration_ms: Date.now() - started,
-        error_message: 'Sin respuesta de la API de facturación.',
-      });
-      throw new Error('Sin respuesta de la API de facturación.');
+        response_payload: {
+          ...response.data,
+          factura_snapshot: {
+            id: facturaSaved.id,
+            cae: facturaSaved.cae,
+            vencimiento: facturaSaved.vencimiento,
+            nro_comprobante: facturaSaved.nro_comprobante,
+            fecha: facturaSaved.fecha,
+            qr_url: facturaSaved.qr_url,
+          },
+        },
+        factura_id: facturaSaved.id, // setear FK
+      };
+
+      await this.facturaLogRepo.save(partial);
+
+      return facturaSaved;
+    } catch (e: any) {
+      // Si el throw vino de Axios con response (network u otro), registramos acá también
+      if (e?.response) {
+        this.logAxiosError('facturar:catch', e);
+        await this.facturaLogRepo.update(log.id, {
+          status: 'error',
+          attempts,
+          duration_ms: Date.now() - started,
+          error_message: String(
+            e?.response?.data?.message ?? e.message ?? 'Error desconocido al facturar',
+          ),
+          response_payload: {
+            status: e.response.status,
+            headers: e.response.headers,
+            data:
+              typeof e.response.data === 'string'
+                ? e.response.data
+                : (e.response.data ?? null),
+          },
+        });
+      }
+      throw e;
     }
-
-    // === Persistir Factura “cruda” como antes
-    const { cae, vencimiento, nro_comprobante, fecha, qr_url } = response.data;
-
-    const factura = this.facturaRepo.create({
-      cae,
-      vencimiento,
-      nro_comprobante: Number(nro_comprobante),
-      fecha,
-      qr_url,
-      empresa,
-    });
-    const facturaSaved = await this.facturaRepo.save(factura);
-
-    // === Actualizar log con SUCCESS + response
-    const partial: DeepPartial<FacturaLog> = {
-    id: log.id, // <- PK para actualizar
-    status: 'success',
-    attempts,
-    duration_ms: Date.now() - started,
-    response_payload: {
-      ...response.data,
-      // ⚠️ NO JSON.stringify: es JSONB, TypeORM serializa
-      factura_snapshot: {
-        id: facturaSaved.id,
-        cae: facturaSaved.cae,
-        vencimiento: facturaSaved.vencimiento,
-        nro_comprobante: facturaSaved.nro_comprobante,
-        fecha: facturaSaved.fecha,
-        qr_url: facturaSaved.qr_url,
-      },
-    },
-    factura_id: facturaSaved.id, // setear FK, no objeto relación aquí
-  };
-
-  await this.facturaLogRepo.save(partial);
-
-    return facturaSaved;
-  } catch (e) {
-    // ya se actualizó el log a 'error' adentro del catch del bucle
-    throw e;
   }
-}
-
 
   async obtenerTodas(empresaId: number): Promise<Factura[]> {
     return this.facturaRepo.find({
@@ -334,13 +411,6 @@ export class FacturaService {
       relations: ['empresa'],
     });
   }
-
-
-
-
-
-
-
 
   async listFacturaLogs(query: QueryFacturaLogDto): Promise<FacturaLogListResult> {
     const {

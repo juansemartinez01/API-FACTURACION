@@ -83,6 +83,9 @@ type CrearFacturaConLoginPayload = {
 
   // seteado por el controller
   empresaId?: number;
+
+  // 🔗 IDs de ventas asociadas (opcional)
+  ventas_ids?: number[] | null;
 };
 
 @Injectable()
@@ -347,6 +350,7 @@ export class FacturaService {
         fecha,
         qr_url,
         empresa,
+        ventas_ids: dto.ventas_ids ?? null,
       });
       const facturaSaved = await this.facturaRepo.save(factura);
 

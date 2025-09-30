@@ -21,6 +21,9 @@ export class Factura {
   @Column()
   qr_url: string;
 
-  @ManyToOne(() => Empresa, empresa => empresa.facturas)
+  @ManyToOne(() => Empresa, (empresa) => empresa.facturas)
   empresa: Empresa;
+
+  @Column('int', { array: true, nullable: true, default: null })
+  ventas_ids?: number[] | null;
 }

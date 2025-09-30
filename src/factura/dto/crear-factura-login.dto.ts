@@ -139,4 +139,9 @@ export class CrearFacturaConLoginDto {
   @IsOptional()
   @IsNumber()
   empresaId?: number;
+
+  @IsOptional()
+  @IsArray()
+  @IsNumber({}, { each: true })
+  ventas_ids?: number[] | null;
 }
